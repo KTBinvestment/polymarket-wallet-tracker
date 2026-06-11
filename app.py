@@ -4,7 +4,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from polymarket_api import get_user_activity, get_user_trades
+from polymarket_api import (
+    DEFAULT_LIMIT,
+    PolymarketAPIError,
+    get_user_activity,
+    get_user_trades,
+    test_data_api,
+)
 
 SPORT_KEYWORDS = [
     " vs ", " v ", "spread:", "o/u", "over", "under", "will ",
@@ -35,6 +41,33 @@ def normalize_number(series):
     return pd.to_numeric(series, errors="coerce")
 
 
+def parse_wallets(text: str):
+    return [w.strip() for w in text.splitlines() if w.strip() and not w.strip().startswith("#")]
+
+
+def fetch_wallet_records(wallet: str, limit: int):
+    try:
+        return get_user_trades(wallet, limit=limit), "trades", None
+    except PolymarketAPIError as trades_error:
+        try:
+            records = get_user_activity(wallet, limit=limit)
+            warning = f"{wallet}: /trades error: {trades_error}; użyto fallback /activity."
+            return records, "activity", warning
+        except PolymarketAPIError as activity_error:
+            raise PolymarketAPIError(
+                f"/trades: {trades_error}; /activity: {activity_error}"
+            ) from activity_error
+
+
+def append_records(target, records, wallet: str, source: str):
+    for item in records:
+        row = dict(item)
+        row["watchedWallet"] = wallet
+        row["walletShort"] = short_wallet(wallet)
+        row["source"] = source
+        target.append(row)
+
+
 with st.sidebar:
     st.header("Portfele")
     default_wallets = "\n".join([
@@ -47,15 +80,26 @@ with st.sidebar:
         value=default_wallets,
         height=180,
     )
-    limit = st.slider("Ile rekordów pobierać na portfel", 10, 500, 500, step=10)
+    limit = st.slider("Ile rekordów pobierać na portfel", 10, 500, DEFAULT_LIMIT, step=10)
     only_sports = st.checkbox("Pokaż tylko prawdopodobne rynki sportowe", value=True)
     min_size = st.number_input("Minimalny size", min_value=0.0, value=0.0, step=10.0)
+
+    sidebar_wallets = parse_wallets(wallets_text)
+    if st.button("Test API"):
+        test_wallet = sidebar_wallets[0] if sidebar_wallets else None
+        with st.spinner("Sprawdzam data-api.polymarket.com..."):
+            try:
+                result = test_data_api(test_wallet)
+                st.success(result["message"])
+            except (PolymarketAPIError, ValueError) as exc:
+                st.error(f"Błąd połączenia z Data API: {exc}")
+
     save = st.button("Zapisz portfele")
     if save:
         wallets_file.write_text(wallets_text.strip() + "\n", encoding="utf-8")
         st.success("Zapisano wallets.txt")
 
-wallets = [w.strip() for w in wallets_text.splitlines() if w.strip() and not w.strip().startswith("#")]
+wallets = parse_wallets(wallets_text)
 
 if not wallets:
     st.info("Wklej pierwszy adres portfela Polymarket po lewej stronie i kliknij 'Zapisz portfele'.")
@@ -63,28 +107,49 @@ if not wallets:
 
 all_rows = []
 errors = []
+status_rows = []
+
+st.subheader("Status portfeli")
+status_panel = st.container()
 
 for wallet in wallets:
+    wallet_label = short_wallet(wallet)
+    status_row = {
+        "portfel": wallet_label,
+        "status": "pobieram",
+        "rekordy": 0,
+        "źródło": "",
+        "szczegóły": "",
+    }
+    status_rows.append(status_row)
+
+    with status_panel:
+        status_slot = st.empty()
+    status_slot.info(f"{wallet_label}: pobieram")
+
     try:
-        trades = get_user_trades(wallet, limit=limit)
-        for item in trades:
-            row = dict(item)
-            row["watchedWallet"] = wallet
-            row["walletShort"] = short_wallet(wallet)
-            row["source"] = "trades"
-            all_rows.append(row)
-    except Exception as e:
-        errors.append(f"{wallet}: trades error: {e}")
-        try:
-            activity = get_user_activity(wallet, limit=limit)
-            for item in activity:
-                row = dict(item)
-                row["watchedWallet"] = wallet
-                row["walletShort"] = short_wallet(wallet)
-                row["source"] = "activity"
-                all_rows.append(row)
-        except Exception as e2:
-            errors.append(f"{wallet}: activity error: {e2}")
+        records, source, warning = fetch_wallet_records(wallet, limit=limit)
+        if warning:
+            errors.append(warning)
+
+        status_row["źródło"] = source
+        status_row["rekordy"] = len(records)
+
+        if records:
+            append_records(all_rows, records, wallet, source)
+            status_row["status"] = f"pobrano {len(records)} rekordów"
+            status_slot.success(f"{wallet_label}: pobrano {len(records)} rekordów ({source})")
+        else:
+            status_row["status"] = "brak danych"
+            status_slot.warning(f"{wallet_label}: brak danych ({source})")
+    except (PolymarketAPIError, ValueError) as exc:
+        message = str(exc)
+        status_row["status"] = "błąd połączenia"
+        status_row["szczegóły"] = message
+        errors.append(f"{wallet}: {message}")
+        status_slot.error(f"{wallet_label}: błąd połączenia")
+
+st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
 
 if errors:
     with st.expander("Błędy / ostrzeżenia"):
@@ -92,7 +157,7 @@ if errors:
             st.write(err)
 
 if not all_rows:
-    st.warning("Nie pobrano żadnych transakcji. Sprawdź, czy adres portfela jest poprawny.")
+    st.warning("Nie pobrano żadnych transakcji. Sprawdź adresy portfeli albo kliknij 'Test API' w panelu bocznym.")
     st.stop()
 
 df = pd.DataFrame(all_rows)
@@ -126,14 +191,13 @@ if min_size > 0:
     filtered = filtered[filtered["size_num"].fillna(0) >= min_size]
 
 # Save snapshots locally for later analysis.
-ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 df.to_csv(Path("data") / "latest_raw.csv", index=False)
 filtered.to_csv(Path("data") / "latest_filtered.csv", index=False)
 
 st.subheader("Szybki podgląd")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Portfele", len(wallets))
-col2.metric("Pobrane transakcje", len(df))
+col2.metric("Pobrane rekordy", len(df))
 col3.metric("Po filtrach", len(filtered))
 col4.metric("Sport guess", int(df["is_sport_guess"].sum()))
 
