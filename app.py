@@ -11,6 +11,7 @@ from polymarket_api import (
     get_user_trades,
     test_data_api,
 )
+from wallet_discovery import discover_copy_wallets
 
 SPORT_KEYWORDS = [
     " vs ", " v ", "spread:", "o/u", "over", "under", "will ",
@@ -203,6 +204,32 @@ with st.sidebar:
         step=5,
     )
 
+    st.header("Szukacz walletow")
+    discovery_total_trades = st.slider("Ile publicznych tradeow skanowac", 500, 3500, 2500, step=500)
+    discovery_min_attempts = st.slider("Minimum prob dla kandydata", 3, 30, 5, step=1)
+    discovery_top_to_add = st.slider("Ile top walletow dopisac", 3, 25, 10, step=1)
+    if st.button("Szukaj nowych walletow"):
+        with st.spinner("Skanuje publiczne transakcje i licze ranking..."):
+            try:
+                discovery = discover_copy_wallets(
+                    total_trades=discovery_total_trades,
+                    max_slippage_pct=max_slippage_pct,
+                    max_match_seconds=max_match_seconds,
+                    min_attempts=discovery_min_attempts,
+                )
+                ranking = discovery["ranking"]
+                st.session_state["discovery_ranking"] = ranking
+                st.session_state["discovery_counts"] = {
+                    "raw": len(discovery["raw"]),
+                    "sports": len(discovery["sports"]),
+                    "wallets": int(discovery["sports"]["proxyWallet"].nunique()) if not discovery["sports"].empty else 0,
+                }
+                Path("data").mkdir(exist_ok=True)
+                ranking.to_csv(Path("data") / "wallet_discovery_ranking.csv", index=False)
+                st.success(f"Znaleziono {len(ranking)} kandydatow. Ranking zapisany do data/wallet_discovery_ranking.csv")
+            except Exception as exc:
+                st.error(f"Nie udalo sie wykonac skanu: {exc}")
+
     sidebar_wallets = parse_wallets(wallets_text)
     if st.button("Test API"):
         test_wallet = sidebar_wallets[0] if sidebar_wallets else None
@@ -323,6 +350,41 @@ col4.metric("Sport guess", int(df["is_sport_guess"].sum()))
 if len(filtered) == 0:
     st.warning("Po filtrach nie zostaly zadne rekordy. Odznacz filtr sportowy albo zmniejsz minimalny size.")
     st.stop()
+discovery_ranking = st.session_state.get("discovery_ranking")
+if discovery_ranking is not None and not discovery_ranking.empty:
+    st.subheader("Nowi kandydaci z publicznych transakcji")
+    counts = st.session_state.get("discovery_counts", {})
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Przeskanowane trade'y", counts.get("raw", 0))
+    d2.metric("Sport/e-sport", counts.get("sports", 0))
+    d3.metric("Unikalne wallety", counts.get("wallets", 0))
+
+    existing_wallets = set(parse_wallets(wallets_text))
+    new_candidates = discovery_ranking[~discovery_ranking["wallet"].isin(existing_wallets)].copy()
+    if new_candidates.empty:
+        st.info("Wszystkie znalezione top wallety sa juz na Twojej liscie obserwowanych.")
+    else:
+        display_cols = [
+            "wallet", "score",
+            "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
+            "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
+            "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",
+        ]
+        display_cols = [col for col in display_cols if col in new_candidates.columns]
+        st.dataframe(new_candidates[display_cols].head(30), use_container_width=True, hide_index=True, height=280)
+
+        top_wallets = new_candidates["wallet"].head(discovery_top_to_add).tolist()
+        st.text_area(
+            "Top adresy do sprawdzenia",
+            value="\n".join(top_wallets),
+            height=160,
+        )
+        if st.button(f"Dopisz top {len(top_wallets)} do obserwowanych"):
+            combined = parse_wallets(wallets_file.read_text(encoding="utf-8")) + top_wallets
+            unique_wallets = list(dict.fromkeys(combined))
+            wallets_file.write_text("\n".join(unique_wallets) + "\n", encoding="utf-8")
+            st.success("Dopisano kandydatow do wallets.txt. Odswiezam aplikacje...")
+            st.rerun()
 
 st.subheader("Symulator kopiowania 1s / 2s / 5s")
 st.caption(
