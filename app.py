@@ -47,7 +47,12 @@ def normalize_number(series):
 
 
 def parse_wallets(text: str):
-    return [w.strip() for w in text.splitlines() if w.strip() and not w.strip().startswith("#")]
+    wallets = []
+    for line in text.splitlines():
+        clean = line.split("#", 1)[0].strip()
+        if clean:
+            wallets.append(clean)
+    return wallets
 
 
 def fetch_wallet_records(wallet: str, limit: int):
@@ -171,11 +176,7 @@ def simulate_copy_entries(
 
 with st.sidebar:
     st.header("Portfele")
-    default_wallets = "\n".join([
-        line.strip()
-        for line in wallets_file.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ])
+    default_wallets = "\n".join(parse_wallets(wallets_file.read_text(encoding="utf-8")))
     wallets_text = st.text_area(
         "Wklej adresy portfeli, po jednym w linii",
         value=default_wallets,
