@@ -103,7 +103,12 @@ def slippage_for_side(side: str, leader_price: float, copy_price: float):
     return abs(copy_price - leader_price)
 
 
-def simulate_copy_entries(frame: pd.DataFrame, max_slippage_pct: float, max_leader_rows: int):
+def simulate_copy_entries(
+    frame: pd.DataFrame,
+    max_slippage_pct: float,
+    max_leader_rows: int,
+    max_match_seconds: int,
+):
     required = {"datetime_utc", "price_num"}
     if frame.empty or not required.issubset(frame.columns):
         return pd.DataFrame()
@@ -144,12 +149,17 @@ def simulate_copy_entries(frame: pd.DataFrame, max_slippage_pct: float, max_lead
                 copy_price = float(copied["price_num"])
                 slippage = slippage_for_side(leader.get("side", ""), leader_price, copy_price)
                 seconds_after = (copied["datetime_utc"] - leader["datetime_utc"]).total_seconds()
+                matched_in_time = seconds_after <= max_match_seconds
+                result = "OK" if slippage <= max_slippage else "za duzy poslizg"
+                if not matched_in_time:
+                    result = "brak ceny w oknie czasowym"
                 row.update({
                     "copy_time": copied["datetime_utc"],
                     "copy_price": copy_price,
                     "seconds_after_move": seconds_after,
-                    "slippage_pct_points": slippage * 100,
-                    "result": "OK" if slippage <= max_slippage else "za duzy poslizg",
+                    "seconds_after_for_stats": seconds_after if matched_in_time else None,
+                    "slippage_pct_points": slippage * 100 if matched_in_time else None,
+                    "result": result,
                 })
 
             rows.append(row)
@@ -182,6 +192,13 @@ with st.sidebar:
         step=0.5,
     )
     max_sim_rows = st.slider("Ile ostatnich ruchow symulowac", 10, 200, 50, step=10)
+    max_match_seconds = st.slider(
+        "Maksymalny czas dopasowania ceny (sekundy)",
+        5,
+        600,
+        30,
+        step=5,
+    )
 
     sidebar_wallets = parse_wallets(wallets_text)
     if st.button("Test API"):
@@ -307,9 +324,15 @@ if len(filtered) == 0:
 st.subheader("Symulator kopiowania 1s / 2s / 5s")
 st.caption(
     "To jest tylko test historyczny na pobranych rekordach. Aplikacja nie sklada zlecen, "
-    "tylko sprawdza, czy po wybranym opoznieniu widac podobna cene w tym samym rynku/outcome."
+    "tylko sprawdza, czy po wybranym opoznieniu widac podobna cene w tym samym rynku/outcome. "
+    "Dopasowania pozniejsze niz limit z panelu bocznego sa odrzucane."
 )
-simulated = simulate_copy_entries(filtered, max_slippage_pct=max_slippage_pct, max_leader_rows=max_sim_rows)
+simulated = simulate_copy_entries(
+    filtered,
+    max_slippage_pct=max_slippage_pct,
+    max_leader_rows=max_sim_rows,
+    max_match_seconds=max_match_seconds,
+)
 
 if simulated.empty:
     st.warning("Symulator nie ma jeszcze danych do porownania. Zwieksz limit pobierania albo dodaj wiecej portfeli.")
@@ -320,8 +343,9 @@ else:
         .agg(
             proby=("result", "count"),
             ok=("ok", "sum"),
+            w_oknie_czasowym=("seconds_after_for_stats", "count"),
             mediana_poslizgu=("slippage_pct_points", "median"),
-            sredni_czas_po_ruchu=("seconds_after_move", "mean"),
+            mediana_czasu_po_ruchu=("seconds_after_for_stats", "median"),
         )
         .reset_index()
     )
@@ -336,6 +360,7 @@ else:
             value = row.iloc[0]
             col.metric(f"Po {delay}s", f"{value['ok_pct']}% OK", f"{int(value['ok'])}/{int(value['proby'])} prob")
 
+    st.caption(f"Liczymy tylko dopasowania znalezione maksymalnie {max_match_seconds}s po ruchu lidera.")
     st.dataframe(sim_summary, use_container_width=True, hide_index=True)
 
     sim_cols = [
