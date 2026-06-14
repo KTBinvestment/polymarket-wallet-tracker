@@ -19,9 +19,14 @@ SPORT_KEYWORDS = [
     "soccer", "football", "basketball", "hockey", "marlins", "red sox",
 ]
 
+COPY_DELAYS_SECONDS = [1, 2, 5]
+
 st.set_page_config(page_title="Polymarket Copy Research", layout="wide")
-st.title("Polymarket Wallet Tracker — etap 2")
-st.caption("Obserwacja portfeli + pierwsza selekcja pod copy-trading. Nadal zero handlu i zero kluczy prywatnych.")
+st.title("Polymarket Wallet Tracker - etap 3")
+st.caption(
+    "Bezpieczny research portfeli Polymarket. Aplikacja nie handluje, "
+    "nie uzywa kluczy prywatnych i nie laczy sie z Twoim portfelem."
+)
 
 wallets_file = Path("wallets.txt")
 wallets_file.touch(exist_ok=True)
@@ -51,7 +56,7 @@ def fetch_wallet_records(wallet: str, limit: int):
     except PolymarketAPIError as trades_error:
         try:
             records = get_user_activity(wallet, limit=limit)
-            warning = f"{wallet}: /trades error: {trades_error}; użyto fallback /activity."
+            warning = f"{wallet}: /trades error: {trades_error}; uzyto fallback /activity."
             return records, "activity", warning
         except PolymarketAPIError as activity_error:
             raise PolymarketAPIError(
@@ -68,6 +73,90 @@ def append_records(target, records, wallet: str, source: str):
         target.append(row)
 
 
+def same_market_candidates(history: pd.DataFrame, leader: pd.Series, target_time):
+    candidates = history[history["datetime_utc"] >= target_time].copy()
+    if candidates.empty:
+        return candidates
+
+    if "conditionId" in candidates.columns and pd.notna(leader.get("conditionId")):
+        candidates = candidates[candidates["conditionId"] == leader.get("conditionId")]
+    elif "title" in candidates.columns and pd.notna(leader.get("title")):
+        candidates = candidates[candidates["title"] == leader.get("title")]
+
+    if "asset" in candidates.columns and pd.notna(leader.get("asset")):
+        candidates = candidates[candidates["asset"] == leader.get("asset")]
+    elif "outcome" in candidates.columns and pd.notna(leader.get("outcome")):
+        candidates = candidates[candidates["outcome"] == leader.get("outcome")]
+
+    if "_row_id" in candidates.columns:
+        candidates = candidates[candidates["_row_id"] != leader.get("_row_id")]
+
+    return candidates.sort_values("datetime_utc", ascending=True)
+
+
+def slippage_for_side(side: str, leader_price: float, copy_price: float):
+    side = str(side or "").upper()
+    if side == "BUY":
+        return copy_price - leader_price
+    if side == "SELL":
+        return leader_price - copy_price
+    return abs(copy_price - leader_price)
+
+
+def simulate_copy_entries(frame: pd.DataFrame, max_slippage_pct: float, max_leader_rows: int):
+    required = {"datetime_utc", "price_num"}
+    if frame.empty or not required.issubset(frame.columns):
+        return pd.DataFrame()
+
+    history = frame.copy().reset_index(drop=True)
+    history["_row_id"] = history.index
+    history = history.dropna(subset=["datetime_utc", "price_num"]).sort_values("datetime_utc")
+    if history.empty:
+        return pd.DataFrame()
+
+    leaders = history.sort_values("datetime_utc", ascending=False).head(max_leader_rows)
+    max_slippage = max_slippage_pct / 100
+    rows = []
+
+    for _, leader in leaders.iterrows():
+        leader_price = float(leader["price_num"])
+        for delay_s in COPY_DELAYS_SECONDS:
+            target_time = leader["datetime_utc"] + pd.Timedelta(seconds=delay_s)
+            candidates = same_market_candidates(history, leader, target_time)
+
+            row = {
+                "leader_time": leader["datetime_utc"],
+                "delay_s": delay_s,
+                "wallet": leader.get("walletShort", ""),
+                "side": leader.get("side", ""),
+                "outcome": leader.get("outcome", ""),
+                "title": leader.get("title", ""),
+                "leader_price": leader_price,
+                "copy_time": pd.NaT,
+                "copy_price": None,
+                "seconds_after_move": None,
+                "slippage_pct_points": None,
+                "result": "brak pozniejszej ceny",
+            }
+
+            if not candidates.empty:
+                copied = candidates.iloc[0]
+                copy_price = float(copied["price_num"])
+                slippage = slippage_for_side(leader.get("side", ""), leader_price, copy_price)
+                seconds_after = (copied["datetime_utc"] - leader["datetime_utc"]).total_seconds()
+                row.update({
+                    "copy_time": copied["datetime_utc"],
+                    "copy_price": copy_price,
+                    "seconds_after_move": seconds_after,
+                    "slippage_pct_points": slippage * 100,
+                    "result": "OK" if slippage <= max_slippage else "za duzy poslizg",
+                })
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 with st.sidebar:
     st.header("Portfele")
     default_wallets = "\n".join([
@@ -80,9 +169,19 @@ with st.sidebar:
         value=default_wallets,
         height=180,
     )
-    limit = st.slider("Ile rekordów pobierać na portfel", 10, 500, DEFAULT_LIMIT, step=10)
-    only_sports = st.checkbox("Pokaż tylko prawdopodobne rynki sportowe", value=True)
+    limit = st.slider("Ile rekordow pobierac na portfel", 10, 500, DEFAULT_LIMIT, step=10)
+    only_sports = st.checkbox("Pokaz tylko prawdopodobne rynki sportowe", value=True)
     min_size = st.number_input("Minimalny size", min_value=0.0, value=0.0, step=10.0)
+
+    st.header("Symulator")
+    max_slippage_pct = st.number_input(
+        "Maksymalny poslizg w punktach procentowych",
+        min_value=0.0,
+        max_value=20.0,
+        value=2.0,
+        step=0.5,
+    )
+    max_sim_rows = st.slider("Ile ostatnich ruchow symulowac", 10, 200, 50, step=10)
 
     sidebar_wallets = parse_wallets(wallets_text)
     if st.button("Test API"):
@@ -92,7 +191,7 @@ with st.sidebar:
                 result = test_data_api(test_wallet)
                 st.success(result["message"])
             except (PolymarketAPIError, ValueError) as exc:
-                st.error(f"Błąd połączenia z Data API: {exc}")
+                st.error(f"Blad polaczenia z Data API: {exc}")
 
     save = st.button("Zapisz portfele")
     if save:
@@ -118,8 +217,8 @@ for wallet in wallets:
         "portfel": wallet_label,
         "status": "pobieram",
         "rekordy": 0,
-        "źródło": "",
-        "szczegóły": "",
+        "zrodlo": "",
+        "szczegoly": "",
     }
     status_rows.append(status_row)
 
@@ -132,32 +231,32 @@ for wallet in wallets:
         if warning:
             errors.append(warning)
 
-        status_row["źródło"] = source
+        status_row["zrodlo"] = source
         status_row["rekordy"] = len(records)
 
         if records:
             append_records(all_rows, records, wallet, source)
-            status_row["status"] = f"pobrano {len(records)} rekordów"
-            status_slot.success(f"{wallet_label}: pobrano {len(records)} rekordów ({source})")
+            status_row["status"] = f"pobrano {len(records)} rekordow"
+            status_slot.success(f"{wallet_label}: pobrano {len(records)} rekordow ({source})")
         else:
             status_row["status"] = "brak danych"
             status_slot.warning(f"{wallet_label}: brak danych ({source})")
     except (PolymarketAPIError, ValueError) as exc:
         message = str(exc)
-        status_row["status"] = "błąd połączenia"
-        status_row["szczegóły"] = message
+        status_row["status"] = "blad polaczenia"
+        status_row["szczegoly"] = message
         errors.append(f"{wallet}: {message}")
-        status_slot.error(f"{wallet_label}: błąd połączenia")
+        status_slot.error(f"{wallet_label}: blad polaczenia")
 
 st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
 
 if errors:
-    with st.expander("Błędy / ostrzeżenia"):
+    with st.expander("Bledy / ostrzezenia"):
         for err in errors:
             st.write(err)
 
 if not all_rows:
-    st.warning("Nie pobrano żadnych transakcji. Sprawdź adresy portfeli albo kliknij 'Test API' w panelu bocznym.")
+    st.warning("Nie pobrano zadnych transakcji. Sprawdz adresy portfeli albo kliknij 'Test API' w panelu bocznym.")
     st.stop()
 
 df = pd.DataFrame(all_rows)
@@ -194,7 +293,7 @@ if min_size > 0:
 df.to_csv(Path("data") / "latest_raw.csv", index=False)
 filtered.to_csv(Path("data") / "latest_filtered.csv", index=False)
 
-st.subheader("Szybki podgląd")
+st.subheader("Szybki podglad")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Portfele", len(wallets))
 col2.metric("Pobrane rekordy", len(df))
@@ -202,11 +301,59 @@ col3.metric("Po filtrach", len(filtered))
 col4.metric("Sport guess", int(df["is_sport_guess"].sum()))
 
 if len(filtered) == 0:
-    st.warning("Po filtrach nie zostały żadne rekordy. Odznacz filtr sportowy albo zmniejsz minimalny size.")
+    st.warning("Po filtrach nie zostaly zadne rekordy. Odznacz filtr sportowy albo zmniejsz minimalny size.")
     st.stop()
 
+st.subheader("Symulator kopiowania 1s / 2s / 5s")
+st.caption(
+    "To jest tylko test historyczny na pobranych rekordach. Aplikacja nie sklada zlecen, "
+    "tylko sprawdza, czy po wybranym opoznieniu widac podobna cene w tym samym rynku/outcome."
+)
+simulated = simulate_copy_entries(filtered, max_slippage_pct=max_slippage_pct, max_leader_rows=max_sim_rows)
+
+if simulated.empty:
+    st.warning("Symulator nie ma jeszcze danych do porownania. Zwieksz limit pobierania albo dodaj wiecej portfeli.")
+else:
+    sim_summary = (
+        simulated.assign(ok=simulated["result"].eq("OK"))
+        .groupby("delay_s", dropna=False)
+        .agg(
+            proby=("result", "count"),
+            ok=("ok", "sum"),
+            mediana_poslizgu=("slippage_pct_points", "median"),
+            sredni_czas_po_ruchu=("seconds_after_move", "mean"),
+        )
+        .reset_index()
+    )
+    sim_summary["ok_pct"] = (sim_summary["ok"] / sim_summary["proby"] * 100).round(1)
+
+    s1, s2, s5 = st.columns(3)
+    for col, delay in zip([s1, s2, s5], COPY_DELAYS_SECONDS):
+        row = sim_summary[sim_summary["delay_s"] == delay]
+        if row.empty:
+            col.metric(f"Po {delay}s", "brak danych")
+        else:
+            value = row.iloc[0]
+            col.metric(f"Po {delay}s", f"{value['ok_pct']}% OK", f"{int(value['ok'])}/{int(value['proby'])} prob")
+
+    st.dataframe(sim_summary, use_container_width=True, hide_index=True)
+
+    sim_cols = [
+        "leader_time", "delay_s", "wallet", "side", "outcome", "leader_price",
+        "copy_price", "slippage_pct_points", "seconds_after_move", "result", "title"
+    ]
+    st.dataframe(simulated[sim_cols], use_container_width=True, height=360)
+
+    sim_csv = simulated.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Pobierz CSV symulatora",
+        data=sim_csv,
+        file_name="polymarket_copy_simulator.csv",
+        mime="text/csv",
+    )
+
 # Wallet ranking / research summary
-st.subheader("Ranking obserwowanych portfeli — wersja research")
+st.subheader("Ranking obserwowanych portfeli - wersja research")
 summary = (
     filtered.groupby(["watchedWallet", "walletShort"], dropna=False)
     .agg(
@@ -221,7 +368,7 @@ summary = (
     )
     .reset_index()
 )
-summary["activity_window"] = summary["first_seen"].astype(str) + " → " + summary["last_seen"].astype(str)
+summary["activity_window"] = summary["first_seen"].astype(str) + " -> " + summary["last_seen"].astype(str)
 summary = summary.sort_values(["trades", "est_notional"], ascending=False)
 st.dataframe(
     summary[["walletShort", "trades", "unique_markets", "total_size", "avg_size", "avg_price", "est_notional", "activity_window", "watchedWallet"]],
@@ -229,7 +376,7 @@ st.dataframe(
     height=220,
 )
 
-st.subheader("Największe ruchy")
+st.subheader("Najwieksze ruchy")
 biggest = filtered.sort_values("size_num", ascending=False).head(30)
 preferred_cols_big = ["datetime_utc", "walletShort", "side", "outcome", "price", "size", "notional_est", "title"]
 st.dataframe(biggest[[c for c in preferred_cols_big if c in biggest.columns]], use_container_width=True, height=320)
@@ -246,7 +393,7 @@ csv = filtered[cols].to_csv(index=False).encode("utf-8")
 st.download_button("Pobierz filtrowany CSV", data=csv, file_name="polymarket_wallet_filtered.csv", mime="text/csv")
 
 raw_csv = df.to_csv(index=False).encode("utf-8")
-st.download_button("Pobierz pełny RAW CSV", data=raw_csv, file_name="polymarket_wallet_raw.csv", mime="text/csv")
+st.download_button("Pobierz pelny RAW CSV", data=raw_csv, file_name="polymarket_wallet_raw.csv", mime="text/csv")
 
-st.info("Następny etap: symulator kopiowania. Będziemy liczyć, czy po 1s/2s/5s od ruchu lidera dalej dałoby się wejść z sensownym poślizgiem.")
-st.caption(f"Ostatnie odświeżenie: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+st.info("Etap 3: symulator pokazuje, czy historycznie po 1s/2s/5s nadal pojawiala sie podobna cena. To nadal tylko research, bez handlu.")
+st.caption(f"Ostatnie odswiezenie: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
