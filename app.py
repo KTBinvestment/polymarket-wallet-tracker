@@ -133,6 +133,7 @@ def simulate_copy_entries(
                 "leader_time": leader["datetime_utc"],
                 "delay_s": delay_s,
                 "wallet": leader.get("walletShort", ""),
+                "watchedWallet": leader.get("watchedWallet", ""),
                 "side": leader.get("side", ""),
                 "outcome": leader.get("outcome", ""),
                 "title": leader.get("title", ""),
@@ -140,6 +141,7 @@ def simulate_copy_entries(
                 "copy_time": pd.NaT,
                 "copy_price": None,
                 "seconds_after_move": None,
+                "seconds_after_for_stats": None,
                 "slippage_pct_points": None,
                 "result": "brak pozniejszej ceny",
             }
@@ -362,6 +364,80 @@ else:
 
     st.caption(f"Liczymy tylko dopasowania znalezione maksymalnie {max_match_seconds}s po ruchu lidera.")
     st.dataframe(sim_summary, use_container_width=True, hide_index=True)
+    wallet_rank_source = simulated.copy()
+    if "seconds_after_for_stats" not in wallet_rank_source.columns:
+        wallet_rank_source["seconds_after_for_stats"] = None
+    wallet_rank_source["ok"] = wallet_rank_source["result"].eq("OK")
+
+    wallet_delay = (
+        wallet_rank_source.groupby(["wallet", "watchedWallet", "delay_s"], dropna=False)
+        .agg(
+            proby=("result", "count"),
+            ok=("ok", "sum"),
+            w_oknie=("seconds_after_for_stats", "count"),
+            mediana_poslizgu=("slippage_pct_points", "median"),
+            mediana_czasu=("seconds_after_for_stats", "median"),
+        )
+        .reset_index()
+    )
+    wallet_delay["ok_pct"] = (wallet_delay["ok"] / wallet_delay["proby"] * 100).round(1)
+
+    wallet_ranking = None
+    for delay in COPY_DELAYS_SECONDS:
+        part = wallet_delay[wallet_delay["delay_s"] == delay][[
+            "wallet", "watchedWallet", "proby", "ok", "w_oknie", "ok_pct",
+            "mediana_poslizgu", "mediana_czasu"
+        ]].rename(columns={
+            "proby": f"proby_{delay}s",
+            "ok": f"ok_{delay}s",
+            "w_oknie": f"w_oknie_{delay}s",
+            "ok_pct": f"ok_pct_{delay}s",
+            "mediana_poslizgu": f"mediana_poslizgu_{delay}s",
+            "mediana_czasu": f"mediana_czasu_{delay}s",
+        })
+        wallet_ranking = part if wallet_ranking is None else wallet_ranking.merge(
+            part,
+            on=["wallet", "watchedWallet"],
+            how="outer",
+        )
+
+    if wallet_ranking is not None and not wallet_ranking.empty:
+        for col in ["ok_pct_1s", "ok_pct_2s", "ok_pct_5s"]:
+            if col not in wallet_ranking.columns:
+                wallet_ranking[col] = 0
+        wallet_ranking["score"] = (
+            wallet_ranking["ok_pct_1s"].fillna(0) * 0.5
+            + wallet_ranking["ok_pct_2s"].fillna(0) * 0.3
+            + wallet_ranking["ok_pct_5s"].fillna(0) * 0.2
+        ).round(1)
+        wallet_ranking = wallet_ranking.sort_values(
+            ["score", "ok_pct_1s", "ok_1s"],
+            ascending=False,
+            na_position="last",
+        )
+
+        st.subheader("Ranking walletow pod kopiowanie")
+        st.caption(
+            "Score mocniej premiuje szybkie kopiowanie: 1s ma wage 50%, 2s ma 30%, 5s ma 20%. "
+            "Przy malej liczbie prob patrz tez na kolumny proby i w_oknie."
+        )
+        ranking_cols = [
+            "wallet", "score",
+            "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
+            "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
+            "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",
+            "watchedWallet",
+        ]
+        ranking_cols = [col for col in ranking_cols if col in wallet_ranking.columns]
+        st.dataframe(wallet_ranking[ranking_cols], use_container_width=True, hide_index=True, height=260)
+
+        rank_csv = wallet_ranking.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Pobierz CSV rankingu walletow",
+            data=rank_csv,
+            file_name="polymarket_wallet_copy_ranking.csv",
+            mime="text/csv",
+        )
 
     sim_cols = [
         "leader_time", "delay_s", "wallet", "side", "outcome", "leader_price",
