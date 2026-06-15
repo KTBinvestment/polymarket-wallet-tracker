@@ -161,6 +161,8 @@ def simulate_copy_entries(
                 "outcome": leader.get("outcome", ""),
                 "title": leader.get("title", ""),
                 "leader_price": leader_price,
+                "leader_size": leader.get("size_num", None),
+                "leader_notional_est": leader.get("notional_est", None),
                 "copy_time": pd.NaT,
                 "copy_price": None,
                 "seconds_after_move": None,
@@ -192,6 +194,99 @@ def simulate_copy_entries(
     return pd.DataFrame(rows)
 
 
+def calculate_copy_stake(
+    bankroll: float,
+    leader_notional: float,
+    risk_per_trade_pct: float,
+    max_stake_usdc: float,
+    leader_size_pct: float,
+):
+    risk_stake = bankroll * risk_per_trade_pct / 100
+    stake_limits = [risk_stake, max_stake_usdc]
+    if pd.notna(leader_notional) and float(leader_notional) > 0 and leader_size_pct > 0:
+        stake_limits.append(float(leader_notional) * leader_size_pct / 100)
+    return max(0.0, min(stake_limits))
+
+
+def simulate_money_management(
+    simulated: pd.DataFrame,
+    selected_delay_s: int,
+    starting_bankroll: float,
+    risk_per_trade_pct: float,
+    max_stake_usdc: float,
+    leader_size_pct: float,
+):
+    if simulated.empty:
+        return pd.DataFrame(), {}
+
+    signals = simulated[simulated["delay_s"] == selected_delay_s].copy()
+    if signals.empty:
+        return pd.DataFrame(), {}
+
+    signals = signals.sort_values("leader_time", ascending=True)
+    bankroll = float(starting_bankroll)
+    ledger = []
+
+    for _, signal in signals.iterrows():
+        result = signal.get("result", "")
+        copied = result == "OK" and bankroll > 0
+        stake = 0.0
+        slippage_cost = 0.0
+        action = "pomijam"
+
+        if copied:
+            stake = calculate_copy_stake(
+                bankroll=bankroll,
+                leader_notional=signal.get("leader_notional_est", 0),
+                risk_per_trade_pct=risk_per_trade_pct,
+                max_stake_usdc=max_stake_usdc,
+                leader_size_pct=leader_size_pct,
+            )
+            if stake <= 0:
+                copied = False
+                action = "pomijam - stawka 0"
+            else:
+                slippage_points = signal.get("slippage_pct_points", 0)
+                slippage_points = 0 if pd.isna(slippage_points) else max(float(slippage_points), 0)
+                slippage_cost = stake * slippage_points / 100
+                bankroll = max(0.0, bankroll - slippage_cost)
+                action = "kopiuje"
+        elif result:
+            action = f"pomijam - {result}"
+
+        ledger.append({
+            "leader_time": signal.get("leader_time"),
+            "delay_s": selected_delay_s,
+            "traderName": signal.get("traderName", ""),
+            "profileUrl": signal.get("profileUrl", ""),
+            "wallet": signal.get("wallet", ""),
+            "akcja": action,
+            "stawka_usdc": round(stake, 2),
+            "koszt_poslizgu_usdc": round(slippage_cost, 4),
+            "bankroll_po": round(bankroll, 2),
+            "leader_notional_est": signal.get("leader_notional_est"),
+            "leader_price": signal.get("leader_price"),
+            "copy_price": signal.get("copy_price"),
+            "slippage_pct_points": signal.get("slippage_pct_points"),
+            "result": result,
+            "title": signal.get("title", ""),
+        })
+
+    ledger_frame = pd.DataFrame(ledger)
+    copied_mask = ledger_frame["akcja"].eq("kopiuje") if not ledger_frame.empty else pd.Series(dtype=bool)
+    copied_rows = ledger_frame[copied_mask]
+    summary = {
+        "sygnaly": len(ledger_frame),
+        "skopiowane": int(copied_mask.sum()),
+        "pominiete": int((~copied_mask).sum()) if not ledger_frame.empty else 0,
+        "kapital_startowy": round(float(starting_bankroll), 2),
+        "bankroll_po_kosztach": round(float(ledger_frame["bankroll_po"].iloc[-1]), 2) if not ledger_frame.empty else round(float(starting_bankroll), 2),
+        "koszt_poslizgu": round(float(ledger_frame["koszt_poslizgu_usdc"].sum()), 4) if not ledger_frame.empty else 0.0,
+        "srednia_stawka": round(float(copied_rows["stawka_usdc"].mean()), 2) if not copied_rows.empty else 0.0,
+        "max_stawka": round(float(copied_rows["stawka_usdc"].max()), 2) if not copied_rows.empty else 0.0,
+    }
+    return ledger_frame, summary
+
 with st.sidebar:
     st.header("Portfele")
     default_wallets = "\n".join(parse_wallets(wallets_file.read_text(encoding="utf-8-sig")))
@@ -219,6 +314,40 @@ with st.sidebar:
         600,
         30,
         step=5,
+    )
+
+    st.header("Money management")
+    money_delay_s = st.selectbox(
+        "Opoznienie dla symulacji kapitalu",
+        COPY_DELAYS_SECONDS,
+        index=0,
+        format_func=lambda value: f"{value}s",
+    )
+    starting_bankroll = st.number_input(
+        "Kapital startowy (USDC)",
+        min_value=10.0,
+        value=1000.0,
+        step=100.0,
+    )
+    risk_per_trade_pct = st.number_input(
+        "Ryzyko na jeden ruch (%)",
+        min_value=0.1,
+        max_value=25.0,
+        value=1.0,
+        step=0.1,
+    )
+    max_stake_usdc = st.number_input(
+        "Maksymalna stawka na ruch (USDC)",
+        min_value=1.0,
+        value=25.0,
+        step=5.0,
+    )
+    leader_size_pct = st.number_input(
+        "Maksymalnie % pozycji lidera",
+        min_value=0.1,
+        max_value=100.0,
+        value=10.0,
+        step=1.0,
     )
 
     st.header("Szukacz walletow")
@@ -459,6 +588,54 @@ else:
 
     st.caption(f"Liczymy tylko dopasowania znalezione maksymalnie {max_match_seconds}s po ruchu lidera.")
     st.dataframe(sim_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Money management")
+    st.caption(
+        "To nie liczy koncowego zysku z rynku, bo tu nie mamy jeszcze pelnego zamkniecia pozycji. "
+        "Ta sekcja pokazuje, ile kapitalu byloby angazowane i ile kosztowalby sam poslizg wejscia."
+    )
+    money_ledger, money_summary = simulate_money_management(
+        simulated=simulated,
+        selected_delay_s=money_delay_s,
+        starting_bankroll=starting_bankroll,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_stake_usdc=max_stake_usdc,
+        leader_size_pct=leader_size_pct,
+    )
+
+    if money_ledger.empty:
+        st.warning("Brak danych do symulacji money management dla wybranego opoznienia.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Kapital startowy", f"{money_summary['kapital_startowy']:.2f} USDC")
+        m2.metric("Po kosztach wejsc", f"{money_summary['bankroll_po_kosztach']:.2f} USDC")
+        m3.metric("Skopiowane", f"{money_summary['skopiowane']}/{money_summary['sygnaly']}")
+        m4.metric("Koszt poslizgu", f"{money_summary['koszt_poslizgu']:.4f} USDC")
+
+        m5, m6, m7 = st.columns(3)
+        m5.metric("Srednia stawka", f"{money_summary['srednia_stawka']:.2f} USDC")
+        m6.metric("Najwieksza stawka", f"{money_summary['max_stawka']:.2f} USDC")
+        m7.metric("Pominiete", money_summary["pominiete"])
+
+        money_cols = [
+            "leader_time", "delay_s", "traderName", "profileUrl", "wallet", "akcja",
+            "stawka_usdc", "koszt_poslizgu_usdc", "bankroll_po", "leader_notional_est",
+            "leader_price", "copy_price", "slippage_pct_points", "result", "title"
+        ]
+        st.dataframe(
+            money_ledger[[col for col in money_cols if col in money_ledger.columns]],
+            use_container_width=True,
+            hide_index=True,
+            height=300,
+            column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
+        )
+        money_csv = money_ledger.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Pobierz CSV money management",
+            data=money_csv,
+            file_name="polymarket_money_management.csv",
+            mime="text/csv",
+        )
     wallet_rank_source = simulated.copy()
     if "seconds_after_for_stats" not in wallet_rank_source.columns:
         wallet_rank_source["seconds_after_for_stats"] = None
@@ -555,7 +732,7 @@ else:
 
     sim_cols = [
         "leader_time", "delay_s", "traderName", "profileUrl", "wallet", "side", "outcome", "leader_price",
-        "copy_price", "slippage_pct_points", "seconds_after_move", "result", "title"
+        "leader_size", "leader_notional_est", "copy_price", "slippage_pct_points", "seconds_after_move", "result", "title"
     ]
     st.dataframe(simulated[sim_cols], use_container_width=True, height=360)
 
