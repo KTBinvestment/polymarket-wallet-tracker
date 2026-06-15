@@ -59,6 +59,10 @@ def normalize_number(series):
     return pd.to_numeric(series, errors="coerce")
 
 
+def has_value(value):
+    return pd.notna(value) and str(value).strip() != ""
+
+
 def parse_wallets(text: str):
     wallets = []
     for line in text.splitlines():
@@ -160,6 +164,9 @@ def simulate_copy_entries(
                 "side": leader.get("side", ""),
                 "outcome": leader.get("outcome", ""),
                 "title": leader.get("title", ""),
+                "conditionId": leader.get("conditionId", ""),
+                "asset": leader.get("asset", ""),
+                "eventSlug": leader.get("eventSlug", ""),
                 "leader_price": leader_price,
                 "leader_size": leader.get("size_num", None),
                 "leader_notional_est": leader.get("notional_est", None),
@@ -208,8 +215,52 @@ def calculate_copy_stake(
     return max(0.0, min(stake_limits))
 
 
+def _same_market_history(history: pd.DataFrame, signal: pd.Series, after_time, same_wallet: bool = False):
+    if history.empty or "datetime_utc" not in history.columns or "price_num" not in history.columns:
+        return pd.DataFrame()
+
+    candidates = history[history["datetime_utc"] > after_time].copy()
+    if candidates.empty:
+        return candidates
+
+    if same_wallet and "watchedWallet" in candidates.columns and has_value(signal.get("watchedWallet")):
+        candidates = candidates[candidates["watchedWallet"] == signal.get("watchedWallet")]
+
+    if "conditionId" in candidates.columns and has_value(signal.get("conditionId")):
+        candidates = candidates[candidates["conditionId"] == signal.get("conditionId")]
+    elif "title" in candidates.columns and has_value(signal.get("title")):
+        candidates = candidates[candidates["title"] == signal.get("title")]
+
+    if "asset" in candidates.columns and has_value(signal.get("asset")):
+        candidates = candidates[candidates["asset"] == signal.get("asset")]
+    elif "outcome" in candidates.columns and has_value(signal.get("outcome")):
+        candidates = candidates[candidates["outcome"] == signal.get("outcome")]
+
+    return candidates.dropna(subset=["datetime_utc", "price_num"]).sort_values("datetime_utc", ascending=True)
+
+
+def find_virtual_exit(history: pd.DataFrame, signal: pd.Series):
+    copy_time = signal.get("copy_time")
+    after_time = copy_time if pd.notna(copy_time) else signal.get("leader_time")
+    if pd.isna(after_time):
+        return None, "brak czasu wejscia"
+
+    leader_exits = _same_market_history(history, signal, after_time, same_wallet=True)
+    if not leader_exits.empty and "side" in leader_exits.columns:
+        sells = leader_exits[leader_exits["side"].astype(str).str.upper() == "SELL"]
+        if not sells.empty:
+            return sells.iloc[0], "sell lidera"
+
+    market_marks = _same_market_history(history, signal, after_time, same_wallet=False)
+    if not market_marks.empty:
+        return market_marks.iloc[-1], "ostatnia widoczna cena"
+
+    return None, "otwarta - brak wyceny"
+
+
 def simulate_money_management(
     simulated: pd.DataFrame,
+    market_history: pd.DataFrame,
     selected_delay_s: int,
     starting_bankroll: float,
     risk_per_trade_pct: float,
@@ -229,12 +280,20 @@ def simulate_money_management(
 
     for _, signal in signals.iterrows():
         result = signal.get("result", "")
-        copied = result == "OK" and bankroll > 0
+        side = str(signal.get("side", "")).upper()
+        copied = result == "OK" and side == "BUY" and bankroll > 0
         stake = 0.0
         slippage_cost = 0.0
+        pnl_virtual = 0.0
+        pnl_pct = 0.0
+        exit_time = pd.NaT
+        exit_price = None
+        exit_source = ""
         action = "pomijam"
 
-        if copied:
+        if result == "OK" and side != "BUY":
+            action = "pomijam - SELL nie jest wejsciem"
+        elif copied:
             stake = calculate_copy_stake(
                 bankroll=bankroll,
                 leader_notional=signal.get("leader_notional_est", 0),
@@ -242,15 +301,25 @@ def simulate_money_management(
                 max_stake_usdc=max_stake_usdc,
                 leader_size_pct=leader_size_pct,
             )
-            if stake <= 0:
+            copy_price = signal.get("copy_price")
+            if stake <= 0 or pd.isna(copy_price) or float(copy_price) <= 0:
                 copied = False
-                action = "pomijam - stawka 0"
+                action = "pomijam - brak stawki albo ceny"
             else:
                 slippage_points = signal.get("slippage_pct_points", 0)
                 slippage_points = 0 if pd.isna(slippage_points) else max(float(slippage_points), 0)
                 slippage_cost = stake * slippage_points / 100
-                bankroll = max(0.0, bankroll - slippage_cost)
-                action = "kopiuje"
+                exit_row, exit_source = find_virtual_exit(market_history, signal)
+                if exit_row is not None:
+                    exit_time = exit_row.get("datetime_utc")
+                    exit_price = float(exit_row.get("price_num"))
+                    shares = stake / float(copy_price)
+                    pnl_virtual = shares * (exit_price - float(copy_price))
+                    pnl_pct = pnl_virtual / stake * 100 if stake else 0.0
+                    action = "kopiuje - zamkniete" if exit_source == "sell lidera" else "kopiuje - otwarte MTM"
+                else:
+                    action = "kopiuje - otwarte bez wyceny"
+                bankroll = max(0.0, bankroll + pnl_virtual)
         elif result:
             action = f"pomijam - {result}"
 
@@ -262,8 +331,13 @@ def simulate_money_management(
             "wallet": signal.get("wallet", ""),
             "akcja": action,
             "stawka_usdc": round(stake, 2),
+            "pnl_virtual_usdc": round(pnl_virtual, 4),
+            "pnl_pct": round(pnl_pct, 2),
             "koszt_poslizgu_usdc": round(slippage_cost, 4),
             "bankroll_po": round(bankroll, 2),
+            "exit_time": exit_time,
+            "exit_price": exit_price,
+            "exit_source": exit_source,
             "leader_notional_est": signal.get("leader_notional_est"),
             "leader_price": signal.get("leader_price"),
             "copy_price": signal.get("copy_price"),
@@ -273,17 +347,28 @@ def simulate_money_management(
         })
 
     ledger_frame = pd.DataFrame(ledger)
-    copied_mask = ledger_frame["akcja"].eq("kopiuje") if not ledger_frame.empty else pd.Series(dtype=bool)
+    copied_mask = ledger_frame["akcja"].astype(str).str.startswith("kopiuje") if not ledger_frame.empty else pd.Series(dtype=bool)
     copied_rows = ledger_frame[copied_mask]
+    valued_rows = copied_rows[copied_rows["exit_source"].isin(["sell lidera", "ostatnia widoczna cena"])] if not copied_rows.empty else copied_rows
+    realized_rows = copied_rows[copied_rows["exit_source"].eq("sell lidera")] if not copied_rows.empty else copied_rows
+    open_rows = copied_rows[copied_rows["exit_source"].ne("sell lidera")] if not copied_rows.empty else copied_rows
+    winning_rows = valued_rows[valued_rows["pnl_virtual_usdc"] > 0] if not valued_rows.empty else valued_rows
+    total_pnl = float(ledger_frame["pnl_virtual_usdc"].sum()) if not ledger_frame.empty else 0.0
     summary = {
         "sygnaly": len(ledger_frame),
         "skopiowane": int(copied_mask.sum()),
         "pominiete": int((~copied_mask).sum()) if not ledger_frame.empty else 0,
+        "zamkniete": len(realized_rows),
+        "otwarte": len(open_rows),
         "kapital_startowy": round(float(starting_bankroll), 2),
-        "bankroll_po_kosztach": round(float(ledger_frame["bankroll_po"].iloc[-1]), 2) if not ledger_frame.empty else round(float(starting_bankroll), 2),
+        "bankroll_po_symulacji": round(float(starting_bankroll) + total_pnl, 2),
+        "pnl_virtual": round(total_pnl, 4),
+        "pnl_zamkniety": round(float(realized_rows["pnl_virtual_usdc"].sum()), 4) if not realized_rows.empty else 0.0,
+        "pnl_otwarty": round(float(open_rows["pnl_virtual_usdc"].sum()), 4) if not open_rows.empty else 0.0,
         "koszt_poslizgu": round(float(ledger_frame["koszt_poslizgu_usdc"].sum()), 4) if not ledger_frame.empty else 0.0,
         "srednia_stawka": round(float(copied_rows["stawka_usdc"].mean()), 2) if not copied_rows.empty else 0.0,
         "max_stawka": round(float(copied_rows["stawka_usdc"].max()), 2) if not copied_rows.empty else 0.0,
+        "win_rate": round(len(winning_rows) / len(valued_rows) * 100, 1) if len(valued_rows) else 0.0,
     }
     return ledger_frame, summary
 
@@ -591,11 +676,12 @@ else:
 
     st.subheader("Money management")
     st.caption(
-        "To nie liczy koncowego zysku z rynku, bo tu nie mamy jeszcze pelnego zamkniecia pozycji. "
-        "Ta sekcja pokazuje, ile kapitalu byloby angazowane i ile kosztowalby sam poslizg wejscia."
+        "To jest wirtualny test: BUY traktujemy jako wejscie, a pozniejszy SELL lidera jako wyjscie. "
+        "Jesli nie ma SELL w pobranych danych, pozycja jest wyceniana po ostatniej widocznej cenie jako MTM."
     )
     money_ledger, money_summary = simulate_money_management(
         simulated=simulated,
+        market_history=filtered,
         selected_delay_s=money_delay_s,
         starting_bankroll=starting_bankroll,
         risk_per_trade_pct=risk_per_trade_pct,
@@ -608,18 +694,20 @@ else:
     else:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Kapital startowy", f"{money_summary['kapital_startowy']:.2f} USDC")
-        m2.metric("Po kosztach wejsc", f"{money_summary['bankroll_po_kosztach']:.2f} USDC")
-        m3.metric("Skopiowane", f"{money_summary['skopiowane']}/{money_summary['sygnaly']}")
-        m4.metric("Koszt poslizgu", f"{money_summary['koszt_poslizgu']:.4f} USDC")
+        m2.metric("P/L virtual", f"{money_summary['pnl_virtual']:.4f} USDC")
+        m3.metric("Bankroll po symulacji", f"{money_summary['bankroll_po_symulacji']:.2f} USDC")
+        m4.metric("Skopiowane", f"{money_summary['skopiowane']}/{money_summary['sygnaly']}")
 
-        m5, m6, m7 = st.columns(3)
-        m5.metric("Srednia stawka", f"{money_summary['srednia_stawka']:.2f} USDC")
-        m6.metric("Najwieksza stawka", f"{money_summary['max_stawka']:.2f} USDC")
-        m7.metric("Pominiete", money_summary["pominiete"])
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Zamkniete", money_summary["zamkniete"])
+        m6.metric("Otwarte/MTM", money_summary["otwarte"])
+        m7.metric("Win rate", f"{money_summary['win_rate']}%")
+        m8.metric("Koszt poslizgu", f"{money_summary['koszt_poslizgu']:.4f} USDC")
 
         money_cols = [
             "leader_time", "delay_s", "traderName", "profileUrl", "wallet", "akcja",
-            "stawka_usdc", "koszt_poslizgu_usdc", "bankroll_po", "leader_notional_est",
+            "stawka_usdc", "pnl_virtual_usdc", "pnl_pct", "bankroll_po", "exit_time",
+            "exit_price", "exit_source", "koszt_poslizgu_usdc", "leader_notional_est",
             "leader_price", "copy_price", "slippage_pct_points", "result", "title"
         ]
         st.dataframe(
@@ -732,7 +820,7 @@ else:
 
     sim_cols = [
         "leader_time", "delay_s", "traderName", "profileUrl", "wallet", "side", "outcome", "leader_price",
-        "leader_size", "leader_notional_est", "copy_price", "slippage_pct_points", "seconds_after_move", "result", "title"
+        "leader_size", "leader_notional_est", "copy_price", "slippage_pct_points", "seconds_after_move", "result", "conditionId", "asset", "title"
     ]
     st.dataframe(simulated[sim_cols], use_container_width=True, height=360)
 
