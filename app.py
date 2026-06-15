@@ -38,6 +38,18 @@ def short_wallet(w: str) -> str:
     return f"{w[:6]}...{w[-4:]}" if isinstance(w, str) and len(w) > 12 else str(w)
 
 
+def polymarket_profile_url(wallet: str) -> str:
+    return f"https://polymarket.com/profile/{wallet}"
+
+
+def trader_name(row, fallback_wallet: str) -> str:
+    for key in ("name", "pseudonym"):
+        value = row.get(key, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return short_wallet(fallback_wallet)
+
+
 def is_sport_title(title: str) -> bool:
     t = str(title or "").lower()
     return any(k in t for k in SPORT_KEYWORDS)
@@ -75,6 +87,8 @@ def append_records(target, records, wallet: str, source: str):
         row = dict(item)
         row["watchedWallet"] = wallet
         row["walletShort"] = short_wallet(wallet)
+        row["traderName"] = trader_name(row, wallet)
+        row["profileUrl"] = polymarket_profile_url(wallet)
         row["source"] = source
         target.append(row)
 
@@ -139,6 +153,8 @@ def simulate_copy_entries(
                 "leader_time": leader["datetime_utc"],
                 "delay_s": delay_s,
                 "wallet": leader.get("walletShort", ""),
+                "traderName": leader.get("traderName", leader.get("walletShort", "")),
+                "profileUrl": leader.get("profileUrl", polymarket_profile_url(leader.get("watchedWallet", ""))),
                 "watchedWallet": leader.get("watchedWallet", ""),
                 "side": leader.get("side", ""),
                 "outcome": leader.get("outcome", ""),
@@ -365,13 +381,19 @@ if discovery_ranking is not None and not discovery_ranking.empty:
         st.info("Wszystkie znalezione top wallety sa juz na Twojej liscie obserwowanych.")
     else:
         display_cols = [
-            "wallet", "score",
+            "traderName", "profileUrl", "wallet", "score",
             "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
             "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
             "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",
         ]
         display_cols = [col for col in display_cols if col in new_candidates.columns]
-        st.dataframe(new_candidates[display_cols].head(30), use_container_width=True, hide_index=True, height=280)
+        st.dataframe(
+            new_candidates[display_cols].head(30),
+            use_container_width=True,
+            hide_index=True,
+            height=280,
+            column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
+        )
 
         top_wallets = new_candidates["wallet"].head(discovery_top_to_add).tolist()
         st.text_area(
@@ -433,7 +455,7 @@ else:
     wallet_rank_source["ok"] = wallet_rank_source["result"].eq("OK")
 
     wallet_delay = (
-        wallet_rank_source.groupby(["wallet", "watchedWallet", "delay_s"], dropna=False)
+        wallet_rank_source.groupby(["wallet", "traderName", "profileUrl", "watchedWallet", "delay_s"], dropna=False)
         .agg(
             proby=("result", "count"),
             ok=("ok", "sum"),
@@ -448,7 +470,7 @@ else:
     wallet_ranking = None
     for delay in COPY_DELAYS_SECONDS:
         part = wallet_delay[wallet_delay["delay_s"] == delay][[
-            "wallet", "watchedWallet", "proby", "ok", "w_oknie", "ok_pct",
+            "wallet", "traderName", "profileUrl", "watchedWallet", "proby", "ok", "w_oknie", "ok_pct",
             "mediana_poslizgu", "mediana_czasu"
         ]].rename(columns={
             "proby": f"proby_{delay}s",
@@ -460,7 +482,7 @@ else:
         })
         wallet_ranking = part if wallet_ranking is None else wallet_ranking.merge(
             part,
-            on=["wallet", "watchedWallet"],
+            on=["wallet", "traderName", "profileUrl", "watchedWallet"],
             how="outer",
         )
 
@@ -485,14 +507,20 @@ else:
             "Przy malej liczbie prob patrz tez na kolumny proby i w_oknie."
         )
         ranking_cols = [
-            "wallet", "score",
+            "traderName", "profileUrl", "wallet", "score",
             "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
             "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
             "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",
             "watchedWallet",
         ]
         ranking_cols = [col for col in ranking_cols if col in wallet_ranking.columns]
-        st.dataframe(wallet_ranking[ranking_cols], use_container_width=True, hide_index=True, height=260)
+        st.dataframe(
+            wallet_ranking[ranking_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=260,
+            column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
+        )
 
         rank_csv = wallet_ranking.to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -503,7 +531,7 @@ else:
         )
 
     sim_cols = [
-        "leader_time", "delay_s", "wallet", "side", "outcome", "leader_price",
+        "leader_time", "delay_s", "traderName", "profileUrl", "wallet", "side", "outcome", "leader_price",
         "copy_price", "slippage_pct_points", "seconds_after_move", "result", "title"
     ]
     st.dataframe(simulated[sim_cols], use_container_width=True, height=360)
@@ -519,7 +547,7 @@ else:
 # Wallet ranking / research summary
 st.subheader("Ranking obserwowanych portfeli - wersja research")
 summary = (
-    filtered.groupby(["watchedWallet", "walletShort"], dropna=False)
+    filtered.groupby(["watchedWallet", "walletShort", "traderName", "profileUrl"], dropna=False)
     .agg(
         trades=("title", "count"),
         unique_markets=("title", "nunique"),
@@ -535,23 +563,34 @@ summary = (
 summary["activity_window"] = summary["first_seen"].astype(str) + " -> " + summary["last_seen"].astype(str)
 summary = summary.sort_values(["trades", "est_notional"], ascending=False)
 st.dataframe(
-    summary[["walletShort", "trades", "unique_markets", "total_size", "avg_size", "avg_price", "est_notional", "activity_window", "watchedWallet"]],
+    summary[["traderName", "profileUrl", "walletShort", "trades", "unique_markets", "total_size", "avg_size", "avg_price", "est_notional", "activity_window", "watchedWallet"]],
     use_container_width=True,
     height=220,
+    column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
 )
 
 st.subheader("Najwieksze ruchy")
 biggest = filtered.sort_values("size_num", ascending=False).head(30)
-preferred_cols_big = ["datetime_utc", "walletShort", "side", "outcome", "price", "size", "notional_est", "title"]
-st.dataframe(biggest[[c for c in preferred_cols_big if c in biggest.columns]], use_container_width=True, height=320)
+preferred_cols_big = ["datetime_utc", "traderName", "profileUrl", "walletShort", "side", "outcome", "price", "size", "notional_est", "title"]
+st.dataframe(
+    biggest[[c for c in preferred_cols_big if c in biggest.columns]],
+    use_container_width=True,
+    height=320,
+    column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
+)
 
 st.subheader("Ostatnie ruchy po filtrach")
 preferred_cols = [
-    "datetime_utc", "walletShort", "side", "outcome", "price", "size", "notional_est", "title", "eventSlug",
+    "datetime_utc", "traderName", "profileUrl", "walletShort", "side", "outcome", "price", "size", "notional_est", "title", "eventSlug",
     "conditionId", "asset", "transactionHash", "watchedWallet", "source"
 ]
 cols = [c for c in preferred_cols if c in filtered.columns] + [c for c in filtered.columns if c not in preferred_cols]
-st.dataframe(filtered[cols], use_container_width=True, height=520)
+st.dataframe(
+    filtered[cols],
+    use_container_width=True,
+    height=520,
+    column_config={"profileUrl": st.column_config.LinkColumn("Profil", display_text="Otworz")},
+)
 
 csv = filtered[cols].to_csv(index=False).encode("utf-8")
 st.download_button("Pobierz filtrowany CSV", data=csv, file_name="polymarket_wallet_filtered.csv", mime="text/csv")

@@ -1,4 +1,4 @@
-﻿import time
+import time
 from typing import Dict, List
 
 import pandas as pd
@@ -14,6 +14,22 @@ SPORT_KEYWORDS = [
 ]
 
 DELAYS = [1, 2, 5]
+
+
+def polymarket_profile_url(wallet: str) -> str:
+    return f"https://polymarket.com/profile/{wallet}"
+
+
+def short_wallet(wallet: str) -> str:
+    return f"{wallet[:6]}...{wallet[-4:]}" if isinstance(wallet, str) and len(wallet) > 12 else str(wallet)
+
+
+def trader_name(row, fallback_wallet: str) -> str:
+    for key in ("name", "pseudonym"):
+        value = row.get(key, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return short_wallet(fallback_wallet)
 
 
 def is_sport_title(title: str) -> bool:
@@ -93,6 +109,8 @@ def simulate_public_copyability(
 
             rows.append({
                 "wallet": leader["proxyWallet"],
+                "traderName": trader_name(leader, leader["proxyWallet"]),
+                "profileUrl": polymarket_profile_url(leader["proxyWallet"]),
                 "delay_s": delay,
                 "result": result,
                 "seconds_after": seconds_after,
@@ -113,7 +131,7 @@ def rank_wallets(simulated: pd.DataFrame, min_attempts: int = 5) -> pd.DataFrame
     source["in_window"] = source["result"].isin(["OK", "za duzy poslizg"])
 
     grouped = (
-        source.groupby(["wallet", "delay_s"], dropna=False)
+        source.groupby(["wallet", "traderName", "profileUrl", "delay_s"], dropna=False)
         .agg(
             proby=("result", "count"),
             ok=("ok", "sum"),
@@ -129,7 +147,7 @@ def rank_wallets(simulated: pd.DataFrame, min_attempts: int = 5) -> pd.DataFrame
     ranking = None
     for delay in DELAYS:
         part = grouped[grouped["delay_s"] == delay][[
-            "wallet", "proby", "ok", "w_oknie", "ok_pct", "mediana_poslizgu", "mediana_czasu", "notional"
+            "wallet", "traderName", "profileUrl", "proby", "ok", "w_oknie", "ok_pct", "mediana_poslizgu", "mediana_czasu", "notional"
         ]].rename(columns={
             "proby": f"proby_{delay}s",
             "ok": f"ok_{delay}s",
@@ -139,7 +157,7 @@ def rank_wallets(simulated: pd.DataFrame, min_attempts: int = 5) -> pd.DataFrame
             "mediana_czasu": f"mediana_czasu_{delay}s",
             "notional": f"notional_{delay}s",
         })
-        ranking = part if ranking is None else ranking.merge(part, on="wallet", how="outer")
+        ranking = part if ranking is None else ranking.merge(part, on=["wallet", "traderName", "profileUrl"], how="outer")
 
     for col in ["ok_pct_1s", "ok_pct_2s", "ok_pct_5s", "proby_1s", "ok_1s", "w_oknie_1s"]:
         if col not in ranking.columns:
