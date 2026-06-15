@@ -62,9 +62,10 @@ def normalize_number(series):
 def parse_wallets(text: str):
     wallets = []
     for line in text.splitlines():
-        clean = line.split("#", 1)[0].strip()
+        clean = line.split("#", 1)[0]
+        clean = clean.replace("\ufeff", "").replace("\u200b", "").strip()
         if clean:
-            wallets.append(clean)
+            wallets.append(clean.lower())
     return wallets
 
 
@@ -193,7 +194,7 @@ def simulate_copy_entries(
 
 with st.sidebar:
     st.header("Portfele")
-    default_wallets = "\n".join(parse_wallets(wallets_file.read_text(encoding="utf-8")))
+    default_wallets = "\n".join(parse_wallets(wallets_file.read_text(encoding="utf-8-sig")))
     wallets_text = st.text_area(
         "Wklej adresy portfeli, po jednym w linii",
         value=default_wallets,
@@ -411,7 +412,7 @@ if discovery_ranking is not None and not discovery_ranking.empty:
             height=160,
         )
         if st.button(f"Dopisz top {len(top_wallets)} do obserwowanych"):
-            combined = parse_wallets(wallets_file.read_text(encoding="utf-8")) + top_wallets
+            combined = parse_wallets(wallets_file.read_text(encoding="utf-8-sig")) + top_wallets
             unique_wallets = list(dict.fromkeys(combined))
             wallets_file.write_text("\n".join(unique_wallets) + "\n", encoding="utf-8")
             st.success("Dopisano kandydatow do wallets.txt. Odswiezam aplikacje...")
