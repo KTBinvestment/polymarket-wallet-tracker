@@ -11,7 +11,7 @@ from polymarket_api import (
     get_user_trades,
     test_data_api,
 )
-from wallet_discovery import discover_copy_wallets
+from wallet_discovery import discover_copy_wallets, fetch_wallet_profit
 
 SPORT_KEYWORDS = [
     " vs ", " v ", "spread:", "o/u", "over", "under", "will ",
@@ -222,8 +222,15 @@ with st.sidebar:
 
     st.header("Szukacz walletow")
     discovery_total_trades = st.slider("Ile publicznych tradeow skanowac", 500, 3500, 2500, step=500)
-    discovery_min_attempts = st.slider("Minimum prob dla kandydata", 3, 30, 5, step=1)
-    discovery_top_to_add = st.slider("Ile top walletow dopisac", 3, 25, 10, step=1)
+    discovery_min_attempts = st.slider("Minimum prob dla kandydata", 3, 30, 10, step=1)
+    discovery_min_profit = st.number_input(
+        "Minimalny profit tradera ($)",
+        min_value=0.0,
+        value=1000.0,
+        step=500.0,
+    )
+    discovery_min_ok_1s = st.slider("Minimum OK po 1s (%)", 0, 100, 40, step=5)
+    discovery_top_to_add = st.slider("Ile top walletow dopisac", 3, 25, 8, step=1)
     if st.button("Szukaj nowych walletow"):
         with st.spinner("Skanuje publiczne transakcje i licze ranking..."):
             try:
@@ -232,6 +239,8 @@ with st.sidebar:
                     max_slippage_pct=max_slippage_pct,
                     max_match_seconds=max_match_seconds,
                     min_attempts=discovery_min_attempts,
+                    min_profit=discovery_min_profit,
+                    min_ok_1s_pct=discovery_min_ok_1s,
                 )
                 ranking = discovery["ranking"]
                 st.session_state["discovery_ranking"] = ranking
@@ -242,7 +251,7 @@ with st.sidebar:
                 }
                 Path("data").mkdir(exist_ok=True)
                 ranking.to_csv(Path("data") / "wallet_discovery_ranking.csv", index=False)
-                st.success(f"Znaleziono {len(ranking)} kandydatow. Ranking zapisany do data/wallet_discovery_ranking.csv")
+                st.success(f"Znaleziono {len(ranking)} profitowych kandydatow. Ranking zapisany do data/wallet_discovery_ranking.csv")
             except Exception as exc:
                 st.error(f"Nie udalo sie wykonac skanu: {exc}")
 
@@ -381,7 +390,7 @@ if discovery_ranking is not None and not discovery_ranking.empty:
         st.info("Wszystkie znalezione top wallety sa juz na Twojej liscie obserwowanych.")
     else:
         display_cols = [
-            "traderName", "profileUrl", "wallet", "score",
+            "traderName", "profileUrl", "wallet", "profitAmount", "qualityScore", "score",
             "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
             "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
             "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",
@@ -501,13 +510,26 @@ else:
             na_position="last",
         )
 
+        profit_rows = []
+        for wallet in wallet_ranking["watchedWallet"].dropna().unique():
+            profit = fetch_wallet_profit(str(wallet))
+            profit_rows.append({"watchedWallet": wallet, **profit})
+        if profit_rows:
+            profit_frame = pd.DataFrame(profit_rows)
+            profit_frame["profitAmount"] = pd.to_numeric(profit_frame["profitAmount"], errors="coerce")
+            wallet_ranking = wallet_ranking.merge(profit_frame, on="watchedWallet", how="left")
+            wallet_ranking["traderName"] = wallet_ranking.apply(
+                lambda row: row.get("profitName") or row.get("profitPseudonym") or row.get("traderName"),
+                axis=1,
+            )
+
         st.subheader("Ranking walletow pod kopiowanie")
         st.caption(
             "Score mocniej premiuje szybkie kopiowanie: 1s ma wage 50%, 2s ma 30%, 5s ma 20%. "
             "Przy malej liczbie prob patrz tez na kolumny proby i w_oknie."
         )
         ranking_cols = [
-            "traderName", "profileUrl", "wallet", "score",
+            "traderName", "profileUrl", "wallet", "profitAmount", "qualityScore", "score",
             "ok_pct_1s", "ok_1s", "w_oknie_1s", "proby_1s",
             "ok_pct_2s", "ok_2s", "w_oknie_2s", "proby_2s",
             "ok_pct_5s", "ok_5s", "w_oknie_5s", "proby_5s",

@@ -1,7 +1,9 @@
 import time
+from functools import lru_cache
 from typing import Dict, List
 
 import pandas as pd
+import requests
 
 from polymarket_api import PolymarketAPIError, _request_json
 
@@ -14,6 +16,7 @@ SPORT_KEYWORDS = [
 ]
 
 DELAYS = [1, 2, 5]
+LB_API = "https://lb-api.polymarket.com"
 
 
 def polymarket_profile_url(wallet: str) -> str:
@@ -36,6 +39,50 @@ def is_sport_title(title: str) -> bool:
     title = str(title or "").lower()
     return any(keyword in title for keyword in SPORT_KEYWORDS)
 
+
+
+@lru_cache(maxsize=512)
+def fetch_wallet_profit(wallet: str) -> Dict[str, object]:
+    try:
+        response = requests.get(
+            f"{LB_API}/profit",
+            params={"address": wallet},
+            timeout=(5, 15),
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.exceptions.RequestException, ValueError):
+        return {"profitAmount": None, "profitName": "", "profitPseudonym": ""}
+
+    if not isinstance(data, list) or not data:
+        return {"profitAmount": None, "profitName": "", "profitPseudonym": ""}
+
+    first = data[0]
+    return {
+        "profitAmount": first.get("amount"),
+        "profitName": first.get("name") or "",
+        "profitPseudonym": first.get("pseudonym") or "",
+    }
+
+
+def enrich_with_profit(ranking: pd.DataFrame) -> pd.DataFrame:
+    if ranking.empty:
+        return ranking
+
+    rows = []
+    for wallet in ranking["wallet"].dropna().unique():
+        profit = fetch_wallet_profit(str(wallet))
+        rows.append({"wallet": wallet, **profit})
+        time.sleep(0.05)
+
+    profits = pd.DataFrame(rows)
+    enriched = ranking.merge(profits, on="wallet", how="left")
+    enriched["profitAmount"] = pd.to_numeric(enriched["profitAmount"], errors="coerce")
+    enriched["traderName"] = enriched.apply(
+        lambda row: row["profitName"] or row["profitPseudonym"] or row["traderName"],
+        axis=1,
+    )
+    return enriched
 
 def fetch_public_trades(total: int = 3000, page_size: int = 500) -> List[Dict]:
     rows = []
@@ -177,6 +224,8 @@ def discover_copy_wallets(
     max_slippage_pct: float,
     max_match_seconds: int,
     min_attempts: int,
+    min_profit: float = 1000,
+    min_ok_1s_pct: float = 40,
 ) -> Dict[str, object]:
     rows = fetch_public_trades(total=total_trades)
     raw = pd.DataFrame(rows)
@@ -191,4 +240,17 @@ def discover_copy_wallets(
         max_match_seconds=max_match_seconds,
     )
     ranking = rank_wallets(simulated, min_attempts=min_attempts)
+    ranking = enrich_with_profit(ranking)
+    if not ranking.empty:
+        ranking = ranking[
+            (ranking["profitAmount"].fillna(-10**18) >= float(min_profit))
+            & (ranking["ok_pct_1s"].fillna(0) >= float(min_ok_1s_pct))
+            & (ranking["ok_1s"].fillna(0) >= 3)
+        ].copy()
+        ranking["qualityScore"] = (
+            ranking["score"].fillna(0) * 0.65
+            + ranking["profitAmount"].clip(lower=0).fillna(0).pow(0.25) * 3
+            + ranking["proby_1s"].fillna(0).clip(upper=50) * 0.2
+        ).round(1)
+        ranking = ranking.sort_values(["qualityScore", "score", "ok_pct_1s", "profitAmount"], ascending=False)
     return {"raw": raw, "sports": sports, "simulated": simulated, "ranking": ranking}
