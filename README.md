@@ -1,35 +1,62 @@
-# Polymarket Wallet Tracker — Etap 2
+# Polymarket Wallet Tracker - Etap 3
 
-Bezpieczna wersja research: obserwuje portfele, filtruje prawdopodobne rynki sportowe, robi prosty ranking portfeli i pozwala pobrać CSV.
+Bezpieczna aplikacja research do obserwowania portfeli Polymarket. Pobiera publiczne transakcje, filtruje prawdopodobne rynki sportowe, tworzy ranking walletow, szuka nowych kandydatow i symuluje, czy kopiowanie ruchow po 1s/2s/5s mialoby jeszcze sens cenowy.
 
-Nie handluje, nie używa kluczy prywatnych i nie łączy się z Twoim portfelem.
+Aplikacja nie handluje, nie uzywa kluczy prywatnych i nie laczy sie z Twoim portfelem.
 
-## Uruchomienie
+## Szybki start na Windows
+
+Najprosciej:
 
 ```powershell
-cd "B:\POLYMARKET BOT\polymarket_wallet_tracker_v1\polymarket_wallet_tracker"
-..\.venv\Scripts\python.exe -m streamlit run app.py
+cd "sciezka\do\polymarket-wallet-tracker"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\run_app.ps1
 ```
 
-Jeżeli tworzysz nowe środowisko:
+Skrypt utworzy lokalne `.venv`, zainstaluje `requirements.txt` i uruchomi dashboard Streamlit.
+
+## Manualne uruchomienie
 
 ```powershell
+cd "sciezka\do\polymarket-wallet-tracker"
 py -3.12 -m venv .venv
-.venv\Scripts\activate
-cd polymarket_wallet_tracker
-..\.venv\Scripts\python.exe -m pip install -r requirements.txt
-..\.venv\Scripts\python.exe -m streamlit run app.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-## Co jest nowe w Etapie 2
+Jesli `py -3.12` nie dziala, uzyj:
 
-- filtrowanie prawdopodobnych rynków sportowych,
-- ranking portfeli,
-- największe ruchy,
-- szacunkowy notional = price × size,
-- zapis snapshotów do folderu `data`,
-- pobieranie CSV.
+```powershell
+python -m venv .venv
+```
 
-## Co dalej
+## Jak uzywac
 
-Etap 3: symulacja kopiowania po 1s/2s/5s i ocena, czy po ruchu lidera zostaje edge.
+1. Wklej adresy portfeli w panelu bocznym albo uzyj obecnej listy `wallets.txt`.
+2. Kliknij `Test API`, zeby sprawdzic polaczenie z publicznym Data API Polymarket.
+3. Kliknij `Pobierz / odswiez dane z API`, zeby utworzyc lokalna migawke w `data/`.
+4. Analizuj ranking portfeli, najwieksze ruchy, symulator kopiowania i money management.
+5. Uzyj `Szukaj nowych walletow`, zeby przeskanowac publiczne transakcje i znalezc kandydatow.
+
+Zwykle odswiezenie strony korzysta z zapisanej migawki. Nowe dane pobierasz dopiero przyciskiem `Pobierz / odswiez dane z API`.
+
+## Co jest w Etapie 3
+
+- pobieranie publicznych trade'ow portfeli z fallbackiem na activity,
+- filtr sport/e-sport po tytule rynku,
+- ranking obserwowanych portfeli,
+- linki do profili Polymarket,
+- wyszukiwarka nowych walletow z publicznych transakcji,
+- symulacja kopiowania po 1s/2s/5s,
+- money management: kapital, ryzyko na ruch, limit stawki i wirtualny P/L,
+- eksport CSV dla danych filtrowanych, raw, symulatora i money management.
+
+## Aktualny kierunek rozwoju
+
+Najblizszy sensowny krok to Etap 4: ostrzejszy filtr kandydatow i dashboard decyzyjny, czyli mniej szumu, lepszy ranking, blacklisty rynkow, minimalna liczba prob, analiza profitow oraz czytelna lista walletow do obserwowania dalej.
+
+## Bezpieczenstwo
+
+To narzedzie research-only. Nie ma modulu skladania zlecen, nie przechowuje private key i nie powinno byc traktowane jako rekomendacja inwestycyjna.
