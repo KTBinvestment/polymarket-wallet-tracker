@@ -3,5 +3,12 @@ __pycache__/
 .venv/
 .env
 data/*.csv
+data/*.db
+data/*.json
+data/*.jsonl
+data/*.log
+data/*.pid
+data/*.stop
+data/*.txt
 .streamlit/secrets.toml
 streamlit.*.log

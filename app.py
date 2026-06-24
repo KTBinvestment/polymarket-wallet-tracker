@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pandas as pd
 import streamlit as st
@@ -11,6 +14,8 @@ from polymarket_api import (
     get_user_trades,
     test_data_api,
 )
+from paper_dashboard import render_paper_dashboard
+from snapshot_store import SnapshotStore
 from wallet_discovery import discover_copy_wallets, fetch_wallet_profit
 
 SPORT_KEYWORDS = [
@@ -23,7 +28,7 @@ SPORT_KEYWORDS = [
 COPY_DELAYS_SECONDS = [1, 2, 5]
 
 st.set_page_config(page_title="Polymarket Copy Research", layout="wide")
-st.title("Polymarket Wallet Tracker - etap 3")
+st.title("Polymarket Wallet Tracker - etap 4")
 st.caption(
     "Bezpieczny research portfeli Polymarket. Aplikacja nie handluje, "
     "nie uzywa kluczy prywatnych i nie laczy sie z Twoim portfelem."
@@ -34,6 +39,7 @@ wallets_file.touch(exist_ok=True)
 Path("data").mkdir(exist_ok=True)
 raw_snapshot_file = Path("data") / "latest_raw.csv"
 filtered_snapshot_file = Path("data") / "latest_filtered.csv"
+snapshot_store = SnapshotStore(Path("data"))
 
 
 def short_wallet(w: str) -> str:
@@ -154,7 +160,14 @@ def simulate_copy_entries(
     if history.empty:
         return pd.DataFrame()
 
-    leaders = stable_sort_records(history, ascending=False).head(max_leader_rows)
+    descending = stable_sort_records(history, ascending=False)
+    if "watchedWallet" in descending.columns:
+        leaders = (
+            descending.groupby("watchedWallet", group_keys=False, dropna=False)
+            .head(max_leader_rows)
+        )
+    else:
+        leaders = descending.head(max_leader_rows)
     max_slippage = max_slippage_pct / 100
     rows = []
 
@@ -390,7 +403,13 @@ with st.sidebar:
         value=default_wallets,
         height=180,
     )
-    limit = st.slider("Ile rekordow pobierac na portfel", 10, 500, DEFAULT_LIMIT, step=10)
+    limit = st.slider(
+        "Ile rekordow pobierac na portfel",
+        50,
+        5000,
+        500,
+        step=50,
+    )
     only_sports = st.checkbox("Pokaz tylko prawdopodobne rynki sportowe", value=True)
     min_size = st.number_input("Minimalny size", min_value=0.0, value=0.0, step=10.0)
 
@@ -402,7 +421,13 @@ with st.sidebar:
         value=2.0,
         step=0.5,
     )
-    max_sim_rows = st.slider("Ile ostatnich ruchow symulowac", 10, 200, 50, step=10)
+    max_sim_rows = st.slider(
+        "Ile ruchow symulowac na kazdy portfel",
+        10,
+        200,
+        50,
+        step=10,
+    )
     max_match_seconds = st.slider(
         "Maksymalny czas dopasowania ceny (sekundy)",
         5,
@@ -495,12 +520,65 @@ with st.sidebar:
         wallets_file.write_text(wallets_text.strip() + "\n", encoding="utf-8")
         st.success("Zapisano wallets.txt")
 
-    fetch_fresh = st.button("Pobierz / odswiez dane z API", type="primary")
-    use_snapshot = raw_snapshot_file.exists() and not fetch_fresh
+    fetch_fresh = st.button("Pobierz pelna swieza migawke", type="primary")
+    refresh_pid_path = Path("data") / "snapshot_refresh.pid"
+    refresh_status_path = Path("data") / "snapshot_refresh_status.json"
+    refresh_running = False
+    if refresh_pid_path.exists():
+        try:
+            import psutil
+            refresh_running = psutil.pid_exists(
+                int(refresh_pid_path.read_text(encoding="utf-8"))
+            )
+        except Exception:
+            refresh_running = False
+    if fetch_fresh and not refresh_running:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "snapshot_worker.py"),
+                "--records",
+                str(limit),
+            ],
+            cwd=Path(__file__).resolve().parent,
+            creationflags=creation_flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        st.success(
+            "Pobieranie uruchomione w tle. Zwykle trwa 30-90 sekund. "
+            "Odswiez strone, aby zobaczyc wynik."
+        )
+        refresh_running = True
+
+    if refresh_status_path.exists():
+        try:
+            refresh_info = json.loads(
+                refresh_status_path.read_text(encoding="utf-8")
+            )
+            state = refresh_info.get("state")
+            if state == "running":
+                st.info("Pelna migawka jest teraz pobierana w tle.")
+            elif state == "complete":
+                st.success(
+                    f"Ostatnie pobranie OK: {refresh_info.get('trades', 0)} "
+                    "transakcji."
+                )
+            elif state == "error":
+                st.error(
+                    f"Ostatnie pobranie nieudane: {refresh_info.get('error', '')}"
+                )
+        except (OSError, ValueError):
+            pass
+
+    use_snapshot = snapshot_store.exists()
     if use_snapshot:
-        st.caption("Uzywam zapisanej migawki. Wynik nie zmieni sie po zwyklym odswiezeniu strony.")
+        st.caption(
+            "Uzywam zapisanej migawki. Zwykle odswiezenie strony nie pobiera nowych danych."
+        )
     else:
-        st.caption("Kliknieto pobieranie albo nie ma jeszcze migawki - pobiore swieze dane z API.")
+        st.caption("Brak migawki. Kliknij 'Pobierz pelna swieza migawke'.")
 
 wallets = parse_wallets(wallets_text)
 
@@ -508,87 +586,45 @@ if not wallets:
     st.info("Wklej pierwszy adres portfela Polymarket po lewej stronie i kliknij 'Zapisz portfele'.")
     st.stop()
 
-all_rows = []
-errors = []
-status_rows = []
+if not use_snapshot:
+    st.warning("Najpierw pobierz pelna migawke z panelu po lewej.")
+    st.stop()
 
-if use_snapshot:
-    st.subheader("Status portfeli")
-    try:
-        df = pd.read_csv(raw_snapshot_file)
-    except Exception as exc:
-        st.error(f"Nie udalo sie wczytac zapisanej migawki: {exc}")
-        st.info("Kliknij 'Pobierz / odswiez dane z API', zeby utworzyc nowa migawke.")
-        st.stop()
+st.subheader("Status migawki")
+try:
+    df = snapshot_store.load_trades()
+    open_positions_snapshot = snapshot_store.load_open_positions()
+    closed_positions_snapshot = snapshot_store.load_closed_positions()
+except Exception as exc:
+    st.error(f"Nie udalo sie wczytac migawki: {exc}")
+    st.stop()
 
-    if df.empty:
-        st.warning("Zapisana migawka jest pusta. Kliknij 'Pobierz / odswiez dane z API'.")
-        st.stop()
+if df.empty:
+    st.warning("Zapisana migawka jest pusta.")
+    st.stop()
 
-    snapshot_time = datetime.fromtimestamp(raw_snapshot_file.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    st.info(f"Uzywam zapisanej migawki: {len(df)} rekordow, zapisana {snapshot_time}. Wyniki beda stale do kolejnego pobrania danych.")
-    if "watchedWallet" in df.columns:
-        snapshot_status = (
-            df.groupby("watchedWallet", dropna=False)
-            .size()
-            .reset_index(name="rekordy")
-        )
-        snapshot_status["portfel"] = snapshot_status["watchedWallet"].apply(short_wallet)
-        snapshot_status["status"] = "z migawki"
-        st.dataframe(snapshot_status[["portfel", "status", "rekordy", "watchedWallet"]], use_container_width=True, hide_index=True)
-else:
-    st.subheader("Status portfeli")
-    status_panel = st.container()
-
-    for wallet in wallets:
-        wallet_label = short_wallet(wallet)
-        status_row = {
-            "portfel": wallet_label,
-            "status": "pobieram",
-            "rekordy": 0,
-            "zrodlo": "",
-            "szczegoly": "",
-        }
-        status_rows.append(status_row)
-
-        with status_panel:
-            status_slot = st.empty()
-        status_slot.info(f"{wallet_label}: pobieram")
-
-        try:
-            records, source, warning = fetch_wallet_records(wallet, limit=limit)
-            if warning:
-                errors.append(warning)
-
-            status_row["zrodlo"] = source
-            status_row["rekordy"] = len(records)
-
-            if records:
-                append_records(all_rows, records, wallet, source)
-                status_row["status"] = f"pobrano {len(records)} rekordow"
-                status_slot.success(f"{wallet_label}: pobrano {len(records)} rekordow ({source})")
-            else:
-                status_row["status"] = "brak danych"
-                status_slot.warning(f"{wallet_label}: brak danych ({source})")
-        except (PolymarketAPIError, ValueError) as exc:
-            message = str(exc)
-            status_row["status"] = "blad polaczenia"
-            status_row["szczegoly"] = message
-            errors.append(f"{wallet}: {message}")
-            status_slot.error(f"{wallet_label}: blad polaczenia")
-
-    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
-
-    if errors:
-        with st.expander("Bledy / ostrzezenia"):
-            for err in errors:
-                st.write(err)
-
-    if not all_rows:
-        st.warning("Nie pobrano zadnych transakcji. Sprawdz adresy portfeli albo kliknij 'Test API' w panelu bocznym.")
-        st.stop()
-
-    df = pd.DataFrame(all_rows)
+metadata = snapshot_store.metadata()
+st.info(
+    f"Migawka: {len(df)} transakcji, "
+    f"{len(open_positions_snapshot)} otwartych pozycji, "
+    f"{len(closed_positions_snapshot)} zamknietych pozycji. "
+    f"Utworzona: {metadata.get('created_at_utc', 'starsza wersja')}."
+)
+refresh_status = st.session_state.pop("snapshot_refresh_status", None)
+if refresh_status is not None:
+    st.dataframe(refresh_status, use_container_width=True, hide_index=True)
+elif "watchedWallet" in df.columns:
+    snapshot_status = (
+        df.groupby("watchedWallet", dropna=False)
+        .size()
+        .reset_index(name="transakcje")
+    )
+    snapshot_status["portfel"] = snapshot_status["watchedWallet"].apply(short_wallet)
+    st.dataframe(
+        snapshot_status[["portfel", "transakcje", "watchedWallet"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 if "timestamp" in df.columns:
     df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce", utc=True)
@@ -606,6 +642,12 @@ if "side" not in df.columns:
     df["side"] = ""
 if "outcome" not in df.columns:
     df["outcome"] = ""
+if "traderName" not in df.columns:
+    df["traderName"] = df.apply(
+        lambda row: trader_name(row, row.get("watchedWallet", "")), axis=1
+    )
+if "profileUrl" not in df.columns:
+    df["profileUrl"] = df["watchedWallet"].apply(polymarket_profile_url)
 
 df["size_num"] = normalize_number(df["size"])
 df["price_num"] = normalize_number(df["price"])
@@ -618,11 +660,6 @@ if only_sports:
 if min_size > 0:
     filtered = filtered[filtered["size_num"].fillna(0) >= min_size]
 
-# Save snapshots only after a deliberate fresh API fetch.
-if not use_snapshot:
-    df.to_csv(raw_snapshot_file, index=False)
-    filtered.to_csv(filtered_snapshot_file, index=False)
-
 st.subheader("Szybki podglad")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Portfele", len(wallets))
@@ -630,9 +667,30 @@ col2.metric("Pobrane rekordy", len(df))
 col3.metric("Po filtrach", len(filtered))
 col4.metric("Sport guess", int(df["is_sport_guess"].sum()))
 
+with st.expander("Pozycje liderow z Data API"):
+    p1, p2 = st.columns(2)
+    p1.metric("Otwarte pozycje", len(open_positions_snapshot))
+    p2.metric("Zamkniete pozycje", len(closed_positions_snapshot))
+    if not closed_positions_snapshot.empty:
+        realized = pd.to_numeric(
+            closed_positions_snapshot.get("realizedPnl"), errors="coerce"
+        ).sum()
+        st.metric("Laczny realized P/L liderow w migawce", f"{realized:,.2f} USDC")
+        st.dataframe(
+            closed_positions_snapshot,
+            use_container_width=True,
+            hide_index=True,
+            height=260,
+        )
+
 if len(filtered) == 0:
     st.warning("Po filtrach nie zostaly zadne rekordy. Odznacz filtr sportowy albo zmniejsz minimalny size.")
     st.stop()
+
+st.divider()
+render_paper_dashboard(filtered, Path("data"))
+st.divider()
+
 discovery_ranking = st.session_state.get("discovery_ranking")
 if discovery_ranking is not None and not discovery_ranking.empty:
     st.subheader("Nowi kandydaci z publicznych transakcji")
@@ -929,9 +987,11 @@ st.download_button("Pobierz filtrowany CSV", data=csv, file_name="polymarket_wal
 raw_csv = df.to_csv(index=False).encode("utf-8")
 st.download_button("Pobierz pelny RAW CSV", data=raw_csv, file_name="polymarket_wallet_raw.csv", mime="text/csv")
 
-st.info("Etap 3: symulator pokazuje, czy historycznie po 1s/2s/5s nadal pojawiala sie podobna cena. To nadal tylko research, bez handlu.")
-if raw_snapshot_file.exists():
-    snapshot_time = datetime.fromtimestamp(raw_snapshot_file.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    st.caption(f"Migawka danych: {snapshot_time}. Zwykle odswiezenie strony nie pobiera nowych danych.")
-else:
-    st.caption("Brak zapisanej migawki danych.")
+st.info(
+    "Etap 4: historyczny research oraz live paper trading z prawdziwym "
+    "orderbookiem. Realne skladanie zlecen pozostaje wylaczone."
+)
+st.caption(
+    f"Migawka danych: {metadata.get('created_at_utc', 'starsza wersja')}. "
+    "Zwykle odswiezenie strony nie pobiera nowych danych."
+)
